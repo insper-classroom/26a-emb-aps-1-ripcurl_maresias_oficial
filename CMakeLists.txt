@@ -1,34 +1,83 @@
-set(PICO_BOARD pico2 CACHE STRING "Board type")
-cmake_minimum_required(VERSION 3.12)
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.2.0)
+set(toolchainVersion 14_2_Rel1)
+set(picotoolVersion 2.2.0-a4)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
+cmake_minimum_required(VERSION 3.13)
 
-# Pull in SDK (must be before project)
-include(pico_sdk_import.cmake)
+# =========================
+# Configuração padrão Pico
+# =========================
 
-include(pico_extras_import_optional.cmake)
-
-project(pico_emb C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(PICO_SDK_VERSION_STRING VERSION_LESS "1.3.0")
-  message(
-    FATAL_ERROR
-      "Raspberry Pi Pico SDK version 1.3.0 (or later) required. Your version is ${PICO_SDK_VERSION_STRING}"
-  )
-endif()
+# Board
+set(PICO_BOARD pico2 CACHE STRING "Board type")
 
-# Initialize the SDK
+include(pico_sdk_import.cmake)
+
+project(ili9341 C CXX ASM)
+
 pico_sdk_init()
 
-add_compile_options(
-  -Wall -Wno-format # int != int32_t as far as the compiler is concerned because
-                    # gcc has int32_t as long int
-  -Wno-unused-function # we have some for the docs that aren't called
+# =========================
+# Executável
+# =========================
+
+add_executable(ili9341
+    main/main.c
+
+    # ILI9341 driver
+    tft_lcd_ili9341/ili9341/ili9341.c
+
+    # GFX engine
+    tft_lcd_ili9341/gfx/gfx_ili9341.c
+
+    # Touch
+    tft_lcd_ili9341/touch_resistive/touch_resistive.c
 )
 
-if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-  add_compile_options(-Wno-maybe-uninitialized)
-endif()
+# =========================
+# Includes
+# =========================
 
-# Codes subdir:
-add_subdirectory(main)
+target_include_directories(ili9341 PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/tft_lcd_ili9341/gfx
+    ${CMAKE_CURRENT_LIST_DIR}/tft_lcd_ili9341/ili9341
+    ${CMAKE_CURRENT_LIST_DIR}/tft_lcd_ili9341/touch_resistive
+)
+
+# =========================
+# Bibliotecas
+# =========================
+
+target_link_libraries(ili9341
+    pico_stdlib
+    hardware_spi
+    hardware_adc
+)
+
+# =========================
+# STDIO
+# =========================
+
+pico_enable_stdio_uart(ili9341 1)
+pico_enable_stdio_usb(ili9341 0)
+
+# =========================
+# Outputs
+# =========================
+
+pico_add_extra_outputs(ili9341)
