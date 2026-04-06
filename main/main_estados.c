@@ -4,7 +4,6 @@
  * Máquina de estados sem sleep_ms.
  * Toda temporização via alarm callbacks.
  * Sequência aleatória gerada ao pressionar START.
- * Áudio PWM para cada cor, início e erro.
  *
  * Botão START (pino 27) inicia/reinicia o jogo.
  * Em idle todos os LEDs ficam apagados.
@@ -14,19 +13,7 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
-#include "hardware/pwm.h"
-#include "hardware/clocks.h"
-#include "hardware/irq.h"
 #include "pico/time.h"
-
-/* ── Áudios ────────────────────────────────────────────────────────────────── */
-
-#include "audio/amarelo.h"
-#include "audio/azul.h"
-#include "audio/verde.h"
-#include "audio/vermelho.h"
-#include "audio/falha.h"
-#include "audio/inicio.h"
 
 /* ── Pinos ─────────────────────────────────────────────────────────────────── */
 
@@ -40,8 +27,6 @@
 #define LED_BLUE   3
 #define LED_GREEN  4
 #define LED_RED    5
-
-#define AUDIO_PIN  16
 
 /* ── Cores (índices) ───────────────────────────────────────────────────────── */
 
@@ -84,7 +69,7 @@ typedef enum {
 static int       sequence[SEQ_LEN];
 static const int led_pins[4] = {LED_YELLOW, LED_BLUE, LED_GREEN, LED_RED};
 
-/* ── PRNG simples (xorshift32) ─────────────────────────────────────────────── */
+/* ── PRNG simples (xorshift32) — sem stdlib ────────────────────────────────── */
 
 static uint32_t rng_state = 0;
 
@@ -104,85 +89,7 @@ static void generate_sequence(void) {
         sequence[i] = xorshift32() % 4;
 }
 
-/* ── Áudio: identificadores ────────────────────────────────────────────────── */
-
-// Índices para selecionar qual áudio tocar
-#define AUDIO_NONE     -1
-#define AUDIO_AMARELO   0
-#define AUDIO_AZUL      1
-#define AUDIO_VERDE     2
-#define AUDIO_VERMELHO  3
-#define AUDIO_FALHA     4
-#define AUDIO_INICIO    5
-
-// Tabelas de ponteiros e tamanhos dos áudios
-static const unsigned char *audio_data[] = {
-    AMARELO_DATA,
-    AZUL_DATA,
-    VERDE_DATA,
-    VERMELHO_DATA,
-    FALHA_DATA,
-    INICIO_DATA,
-};
-
-static const unsigned int audio_length[] = {
-    AMARELO_DATA_LENGTH,
-    AZUL_DATA_LENGTH,
-    VERDE_DATA_LENGTH,
-    VERMELHO_DATA_LENGTH,
-    FALHA_DATA_LENGTH,
-    INICIO_DATA_LENGTH,
-};
-
-// Mapeamento cor -> áudio
-static const int color_to_audio[] = {
-    AUDIO_AMARELO,   // YELLOW = 0
-    AUDIO_AZUL,      // BLUE   = 1
-    AUDIO_VERDE,     // GREEN  = 2
-    AUDIO_VERMELHO,  // RED    = 3
-};
-
-/* ── Variáveis de áudio (volatile: acessadas na IRQ PWM) ──────────────────── */
-
-volatile int      current_audio = AUDIO_NONE;  // qual áudio está tocando
-volatile uint32_t wav_position  = 0;           // posição no áudio (com repetição 8x)
-
-/* ── Função para iniciar um áudio ──────────────────────────────────────────── */
-
-static void audio_play(int audio_id) {
-    wav_position  = 0;
-    current_audio = audio_id;
-}
-
-static void audio_stop(void) {
-    current_audio = AUDIO_NONE;
-    wav_position  = 0;
-    pwm_set_gpio_level(AUDIO_PIN, 0);
-}
-
-/* ── Handler PWM: reproduz o áudio selecionado ─────────────────────────────── */
-
-void pwm_interrupt_handler(void) {
-    pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));
-
-    int id = current_audio;
-    if (id == AUDIO_NONE) {
-        pwm_set_gpio_level(AUDIO_PIN, 0);
-        return;
-    }
-
-    uint32_t total = audio_length[id] << 3;  // cada amostra repete 8 ciclos
-    if (wav_position < total - 1) {
-        pwm_set_gpio_level(AUDIO_PIN, audio_data[id][wav_position >> 3]);
-        wav_position++;
-    } else {
-        // áudio terminou: silencia (não faz loop)
-        current_audio = AUDIO_NONE;
-        pwm_set_gpio_level(AUDIO_PIN, 0);
-    }
-}
-
-/* ── Variáveis de estado (volatile: compartilhadas com IRQ/callbacks) ──────── */
+/* ── Variáveis de ativação (volatile: compartilhadas com IRQ/callbacks) ────── */
 
 static volatile state_t    state          = ST_IDLE;
 static volatile int        current_level  = 1;
@@ -203,14 +110,18 @@ static void all_leds(bool on) {
         gpio_put(led_pins[i], on);
 }
 
-/* ── Callback de alarme — apenas sinaliza o main ───────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════ *
+ *  Callback de alarme — apenas sinaliza o main                              *
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 static int64_t cb_alarm(alarm_id_t id, void *data) {
     alarm_fired = true;
     return 0;
 }
 
-/* ── IRQ: botões — apenas seta variáveis de ativação ───────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════ *
+ *  IRQ: botões — apenas seta variáveis de ativação                          *
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void btn_callback(uint gpio, uint32_t events) {
     uint32_t now = time_us_32();
@@ -238,7 +149,9 @@ static void btn_callback(uint gpio, uint32_t events) {
     }
 }
 
-/* ── Setup ─────────────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════ *
+ *  Setup                                                                     *
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void setup(void) {
     const int btns[] = {BTN_YELLOW, BTN_BLUE, BTN_GREEN, BTN_RED, BTN_START};
@@ -260,29 +173,14 @@ static void setup(void) {
         gpio_set_dir(led_pins[i], GPIO_OUT);
         gpio_put(led_pins[i], 0);
     }
-
-    /* ── Configura PWM para saída de áudio no AUDIO_PIN ── */
-    gpio_set_function(AUDIO_PIN, GPIO_FUNC_PWM);
-    int audio_pin_slice = pwm_gpio_to_slice_num(AUDIO_PIN);
-
-    pwm_clear_irq(audio_pin_slice);
-    pwm_set_irq_enabled(audio_pin_slice, true);
-    irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_interrupt_handler);
-    irq_set_enabled(PWM_IRQ_WRAP, true);
-
-    pwm_config config = pwm_get_default_config();
-    pwm_config_set_clkdiv(&config, 8.0f);   // 176MHz / 250 / 8 = 88kHz / 8 = 11kHz
-    pwm_config_set_wrap(&config, 250);
-    pwm_init(audio_pin_slice, &config, true);
-
-    pwm_set_gpio_level(AUDIO_PIN, 0);
 }
 
-/* ── Main — máquina de estados completa ────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════ *
+ *  Main — máquina de estados completa                                        *
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 int main(void) {
     stdio_init_all();
-    set_sys_clock_khz(176000, true);  // clock base para o PWM de áudio
     setup();
 
     while (true) {
@@ -293,7 +191,6 @@ int main(void) {
             generate_sequence();
             current_level = 1;
             all_leds(false);
-            audio_play(AUDIO_INICIO);   // toca som de início
             show_idx = 0;
             state    = ST_SHOW_PRE;
             add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, NULL, false);
@@ -308,13 +205,11 @@ int main(void) {
                 case ST_SHOW_PRE:
                     state = ST_SHOW_ON;
                     gpio_put(led_pins[sequence[show_idx]], 1);
-                    audio_play(color_to_audio[sequence[show_idx]]);  // som da cor
                     add_alarm_in_ms(LED_ON_MS, cb_alarm, NULL, false);
                     break;
 
                 case ST_SHOW_ON:
                     gpio_put(led_pins[sequence[show_idx]], 0);
-                    audio_stop();
                     show_idx++;
                     if (show_idx >= current_level) {
                         player_idx    = 0;
@@ -330,13 +225,11 @@ int main(void) {
                 case ST_SHOW_OFF:
                     state = ST_SHOW_ON;
                     gpio_put(led_pins[sequence[show_idx]], 1);
-                    audio_play(color_to_audio[sequence[show_idx]]);  // som da cor
                     add_alarm_in_ms(LED_ON_MS, cb_alarm, NULL, false);
                     break;
 
                 case ST_PLAYER:
-                    /* timeout esgotado */
-                    audio_play(AUDIO_FALHA);
+                    /* alarme no ST_PLAYER = timeout esgotado */
                     state       = ST_ERROR;
                     blink_count = 0;
                     all_leds(true);
@@ -345,10 +238,8 @@ int main(void) {
 
                 case ST_FEEDBACK:
                     gpio_put(led_pins[feedback_color], 0);
-                    audio_stop();
                     if (feedback_color != sequence[player_idx]) {
                         /* ── Cor errada ── */
-                        audio_play(AUDIO_FALHA);
                         state       = ST_ERROR;
                         blink_count = 0;
                         all_leds(true);
@@ -358,7 +249,6 @@ int main(void) {
                         if (player_idx >= current_level) {
                             if (current_level >= SEQ_LEN) {
                                 /* ── Vitória ── */
-                                audio_play(AUDIO_INICIO);  // som de vitória (reutiliza inicio)
                                 state       = ST_WIN;
                                 blink_count = 0;
                                 all_leds(true);
@@ -388,7 +278,6 @@ int main(void) {
                     blink_count++;
                     if (blink_count >= ERR_BLINKS * 2) {
                         all_leds(false);
-                        audio_stop();
                         current_level = 1;
                         state         = ST_WAIT_START;
                     } else {
@@ -401,7 +290,6 @@ int main(void) {
                     blink_count++;
                     if (blink_count >= WIN_BLINKS * 2) {
                         all_leds(false);
-                        audio_stop();
                         current_level = 1;
                         state         = ST_WAIT_START;
                     } else {
@@ -430,7 +318,6 @@ int main(void) {
                 restore_interrupts(ints);
 
                 gpio_put(led_pins[feedback_color], 1);
-                audio_play(color_to_audio[feedback_color]);  // som da cor pressionada
                 add_alarm_in_ms(FEEDBACK_MS, cb_alarm, NULL, false);
             }
         }
