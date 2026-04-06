@@ -66,7 +66,7 @@ typedef enum {
 /* ── Sequência ─────────────────────────────────────────────────────────────── */
 
 #define SEQ_LEN 6
-static int       sequence[SEQ_LEN];
+static int       sequence[SEQ_LEN];                          /* ← era const */
 static const int led_pins[4] = {LED_YELLOW, LED_BLUE, LED_GREEN, LED_RED};
 
 /* ── PRNG simples (xorshift32) — sem stdlib ────────────────────────────────── */
@@ -83,13 +83,13 @@ static uint32_t xorshift32(void) {
 }
 
 static void generate_sequence(void) {
-    rng_state = time_us_32();
-    if (rng_state == 0) rng_state = 1;
+    rng_state = time_us_32();          /* seed = instante humano do START */
+    if (rng_state == 0) rng_state = 1; /* xorshift não aceita 0 */
     for (int i = 0; i < SEQ_LEN; i++)
         sequence[i] = xorshift32() % 4;
 }
 
-/* ── Variáveis de ativação (volatile: compartilhadas com IRQ/callbacks) ────── */
+/* ── Variáveis de estado (volatile: compartilhadas com IRQ) ────────────────── */
 
 static volatile state_t    state          = ST_IDLE;
 static volatile int        current_level  = 1;
@@ -99,9 +99,19 @@ static volatile int        pressed_color  = -1;
 static volatile int        feedback_color = -1;
 static volatile int        blink_count    = 0;
 static volatile bool       start_pressed  = false;
-static volatile bool       alarm_fired    = false;
 static volatile alarm_id_t timeout_id     = 0;
 static volatile uint32_t   last_btn_us    = 0;
+
+/* ── Protótipos dos callbacks ──────────────────────────────────────────────── */
+
+static int64_t cb_pre_done   (alarm_id_t, void *);
+static int64_t cb_led_off    (alarm_id_t, void *);
+static int64_t cb_led_on     (alarm_id_t, void *);
+static int64_t cb_timeout    (alarm_id_t, void *);
+static int64_t cb_fb_done    (alarm_id_t, void *);
+static int64_t cb_level_up   (alarm_id_t, void *);
+static int64_t cb_err_toggle (alarm_id_t, void *);
+static int64_t cb_win_toggle (alarm_id_t, void *);
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
 
@@ -110,17 +120,142 @@ static void all_leds(bool on) {
         gpio_put(led_pins[i], on);
 }
 
+static void start_round(void) {
+    all_leds(false);
+    show_idx = 0;
+    state    = ST_SHOW_PRE;
+    add_alarm_in_ms(PRE_SHOW_MS, cb_pre_done, NULL, false);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════ *
- *  Callback de alarme — apenas sinaliza o main                              *
+ *  Callbacks de exibição da sequência                                        *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static int64_t cb_alarm(alarm_id_t id, void *data) {
-    alarm_fired = true;
+static int64_t cb_pre_done(alarm_id_t id, void *data) {
+    state = ST_SHOW_ON;
+    gpio_put(led_pins[sequence[show_idx]], 1);
+    add_alarm_in_ms(LED_ON_MS, cb_led_off, NULL, false);
+    return 0;
+}
+
+static int64_t cb_led_off(alarm_id_t id, void *data) {
+    gpio_put(led_pins[sequence[show_idx]], 0);
+    show_idx++;
+
+    if (show_idx >= current_level) {
+        player_idx    = 0;
+        pressed_color = -1;
+        state         = ST_PLAYER;
+        timeout_id    = add_alarm_in_ms(TIMEOUT_MS, cb_timeout, NULL, false);
+    } else {
+        state = ST_SHOW_OFF;
+        add_alarm_in_ms(LED_OFF_MS, cb_led_on, NULL, false);
+    }
+    return 0;
+}
+
+static int64_t cb_led_on(alarm_id_t id, void *data) {
+    state = ST_SHOW_ON;
+    gpio_put(led_pins[sequence[show_idx]], 1);
+    add_alarm_in_ms(LED_ON_MS, cb_led_off, NULL, false);
     return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ *
- *  IRQ: botões — apenas seta variáveis de ativação                          *
+ *  Timeout do jogador                                                        *
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int64_t cb_timeout(alarm_id_t id, void *data) {
+    if (state != ST_PLAYER || pressed_color >= 0)
+        return 0;
+
+    state       = ST_ERROR;
+    blink_count = 0;
+    all_leds(true);
+    add_alarm_in_ms(ERR_BLINK_MS, cb_err_toggle, NULL, false);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ *
+ *  Feedback após botão pressionado                                           *
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int64_t cb_fb_done(alarm_id_t id, void *data) {
+    gpio_put(led_pins[feedback_color], 0);
+
+    if (feedback_color != sequence[player_idx]) {
+        /* ── Erro ── */
+        state       = ST_ERROR;
+        blink_count = 0;
+        all_leds(true);
+        add_alarm_in_ms(ERR_BLINK_MS, cb_err_toggle, NULL, false);
+        return 0;
+    }
+
+    player_idx++;
+
+    if (player_idx >= current_level) {
+        if (current_level >= SEQ_LEN) {
+            /* ── Vitória ── */
+            state       = ST_WIN;
+            blink_count = 0;
+            all_leds(true);
+            add_alarm_in_ms(WIN_BLINK_MS, cb_win_toggle, NULL, false);
+        } else {
+            /* ── Próximo nível ── */
+            current_level++;
+            state = ST_LEVEL_UP;
+            add_alarm_in_ms(LEVEL_UP_MS, cb_level_up, NULL, false);
+        }
+    } else {
+        /* ── Aguarda próximo input ── */
+        state      = ST_PLAYER;
+        timeout_id = add_alarm_in_ms(TIMEOUT_MS, cb_timeout, NULL, false);
+    }
+    return 0;
+}
+
+static int64_t cb_level_up(alarm_id_t id, void *data) {
+    start_round();
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ *
+ *  Animação de erro → espera START                                           *
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int64_t cb_err_toggle(alarm_id_t id, void *data) {
+    blink_count++;
+    if (blink_count >= ERR_BLINKS * 2) {
+        all_leds(false);
+        current_level = 1;
+        state         = ST_WAIT_START;
+        return 0;
+    }
+    all_leds(blink_count % 2 == 0);
+    add_alarm_in_ms(ERR_BLINK_MS, cb_err_toggle, NULL, false);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ *
+ *  Animação de vitória → espera START                                        *
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int64_t cb_win_toggle(alarm_id_t id, void *data) {
+    blink_count++;
+    if (blink_count >= WIN_BLINKS * 2) {
+        all_leds(false);
+        current_level = 1;
+        state         = ST_WAIT_START;
+        return 0;
+    }
+    all_leds(blink_count % 2 == 0);
+    add_alarm_in_ms(WIN_BLINK_MS, cb_win_toggle, NULL, false);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ *
+ *  IRQ: botões                                                               *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void btn_callback(uint gpio, uint32_t events) {
@@ -132,12 +267,14 @@ static void btn_callback(uint gpio, uint32_t events) {
     if (!(events & GPIO_IRQ_EDGE_FALL))
         return;
 
+    /* ── Botão START ── */
     if (gpio == BTN_START) {
         if (state == ST_IDLE || state == ST_WAIT_START)
             start_pressed = true;
         return;
     }
 
+    /* ── Botões de cor (só em ST_PLAYER) ── */
     if (state != ST_PLAYER)
         return;
 
@@ -176,131 +313,23 @@ static void setup(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ *
- *  Main — máquina de estados completa                                        *
+ *  Main                                                                      *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 int main(void) {
     stdio_init_all();
     setup();
 
+    /* Começa em ST_IDLE — tudo apagado, esperando START */
+
     while (true) {
 
         /* ── START pressionado ── */
         if (start_pressed) {
             start_pressed = false;
-            generate_sequence();
+            generate_sequence();               /* ← única linha nova no main */
             current_level = 1;
-            all_leds(false);
-            show_idx = 0;
-            state    = ST_SHOW_PRE;
-            add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, NULL, false);
-        }
-
-        /* ── Alarme disparou: processa estado atual ── */
-        if (alarm_fired) {
-            alarm_fired = false;
-
-            switch (state) {
-
-                case ST_SHOW_PRE:
-                    state = ST_SHOW_ON;
-                    gpio_put(led_pins[sequence[show_idx]], 1);
-                    add_alarm_in_ms(LED_ON_MS, cb_alarm, NULL, false);
-                    break;
-
-                case ST_SHOW_ON:
-                    gpio_put(led_pins[sequence[show_idx]], 0);
-                    show_idx++;
-                    if (show_idx >= current_level) {
-                        player_idx    = 0;
-                        pressed_color = -1;
-                        state         = ST_PLAYER;
-                        timeout_id    = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, NULL, false);
-                    } else {
-                        state = ST_SHOW_OFF;
-                        add_alarm_in_ms(LED_OFF_MS, cb_alarm, NULL, false);
-                    }
-                    break;
-
-                case ST_SHOW_OFF:
-                    state = ST_SHOW_ON;
-                    gpio_put(led_pins[sequence[show_idx]], 1);
-                    add_alarm_in_ms(LED_ON_MS, cb_alarm, NULL, false);
-                    break;
-
-                case ST_PLAYER:
-                    /* alarme no ST_PLAYER = timeout esgotado */
-                    state       = ST_ERROR;
-                    blink_count = 0;
-                    all_leds(true);
-                    add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, NULL, false);
-                    break;
-
-                case ST_FEEDBACK:
-                    gpio_put(led_pins[feedback_color], 0);
-                    if (feedback_color != sequence[player_idx]) {
-                        /* ── Cor errada ── */
-                        state       = ST_ERROR;
-                        blink_count = 0;
-                        all_leds(true);
-                        add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, NULL, false);
-                    } else {
-                        player_idx++;
-                        if (player_idx >= current_level) {
-                            if (current_level >= SEQ_LEN) {
-                                /* ── Vitória ── */
-                                state       = ST_WIN;
-                                blink_count = 0;
-                                all_leds(true);
-                                add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, NULL, false);
-                            } else {
-                                /* ── Próximo nível ── */
-                                current_level++;
-                                state = ST_LEVEL_UP;
-                                add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, NULL, false);
-                            }
-                        } else {
-                            /* ── Aguarda próxima cor ── */
-                            state      = ST_PLAYER;
-                            timeout_id = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, NULL, false);
-                        }
-                    }
-                    break;
-
-                case ST_LEVEL_UP:
-                    all_leds(false);
-                    show_idx = 0;
-                    state    = ST_SHOW_PRE;
-                    add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, NULL, false);
-                    break;
-
-                case ST_ERROR:
-                    blink_count++;
-                    if (blink_count >= ERR_BLINKS * 2) {
-                        all_leds(false);
-                        current_level = 1;
-                        state         = ST_WAIT_START;
-                    } else {
-                        all_leds(blink_count % 2 == 0);
-                        add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, NULL, false);
-                    }
-                    break;
-
-                case ST_WIN:
-                    blink_count++;
-                    if (blink_count >= WIN_BLINKS * 2) {
-                        all_leds(false);
-                        current_level = 1;
-                        state         = ST_WAIT_START;
-                    } else {
-                        all_leds(blink_count % 2 == 0);
-                        add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, NULL, false);
-                    }
-                    break;
-
-                default:
-                    break;
-            }
+            start_round();
         }
 
         /* ── Botão de cor durante ST_PLAYER ── */
@@ -318,7 +347,7 @@ int main(void) {
                 restore_interrupts(ints);
 
                 gpio_put(led_pins[feedback_color], 1);
-                add_alarm_in_ms(FEEDBACK_MS, cb_alarm, NULL, false);
+                add_alarm_in_ms(FEEDBACK_MS, cb_fb_done, NULL, false);
             }
         }
 
