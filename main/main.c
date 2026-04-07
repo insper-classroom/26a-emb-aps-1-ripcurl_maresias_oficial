@@ -11,6 +11,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
@@ -18,6 +19,11 @@
 #include "hardware/clocks.h"
 #include "hardware/irq.h"
 #include "pico/time.h"
+
+#include "tft_lcd_ili9341/gfx/gfx_ili9341.h"
+#include "tft_lcd_ili9341/ili9341/ili9341.h"
+
+#include "img_circle_32.h"
 
 /* ── Áudios ────────────────────────────────────────────────────────────────── */
 
@@ -41,7 +47,7 @@
 #define LED_GREEN  4
 #define LED_RED    5
 
-#define AUDIO_PIN  16
+#define AUDIO_PIN  14
 
 /* ── Cores (índices) ───────────────────────────────────────────────────────── */
 
@@ -80,7 +86,7 @@ typedef enum {
 
 /* ── Sequência ─────────────────────────────────────────────────────────────── */
 
-#define SEQ_LEN 6
+#define SEQ_LEN 100
 static const int led_pins[4] = {LED_YELLOW, LED_BLUE, LED_GREEN, LED_RED};
 
 /* ── PRNG simples (xorshift32) ─────────────────────────────────────────────── */
@@ -316,7 +322,7 @@ int main(void) {
                         player_idx    = 0;
                         pressed_color = -1;
                         state         = ST_PLAYER;
-                        timeout_id    = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, (void*)&alarm_fired, false);
+                        timeout_id    = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, NULL, false);
                     } else {
                         state = ST_SHOW_OFF;
                         add_alarm_in_ms(LED_OFF_MS, cb_alarm, (void*)&alarm_fired, false);
@@ -358,12 +364,12 @@ int main(void) {
                                 state       = ST_WIN;
                                 blink_count = 0;
                                 all_leds(true);
-                                add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
+                                add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, NULL, false);
                             } else {
                                 /* ── Próximo nível ── */
                                 current_level++;
                                 state = ST_LEVEL_UP;
-                                add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
+                                add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, NULL, false);
                             }
                         } else {
                             /* ── Aguarda próxima cor ── */
@@ -402,7 +408,7 @@ int main(void) {
                         state         = ST_WAIT_START;
                     } else {
                         all_leds(blink_count % 2 == 0);
-                        add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
+                        add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, NULL, false);
                     }
                     break;
 
@@ -427,7 +433,7 @@ int main(void) {
 
                 gpio_put(led_pins[feedback_color], 1);
                 audio_play(color_to_audio[feedback_color]);  // som da cor pressionada
-                add_alarm_in_ms(FEEDBACK_MS, cb_alarm, (void*)&alarm_fired, false);
+                add_alarm_in_ms(FEEDBACK_MS, cb_alarm, NULL, false);
             }
         }
 
