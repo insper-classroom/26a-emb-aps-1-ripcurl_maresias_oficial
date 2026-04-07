@@ -1,9 +1,8 @@
 /**
  * Genius (Simon Says) — Raspberry Pi Pico
  *
- * Máquina de estados sem sleep_ms.
- * Toda temporização via alarm callbacks.
- * Áudio PWM + display ILI9341 (landscape).
+ * Solo e Dupla. Áudio PWM + ILI9341 landscape.
+ * Sem sleep_ms — toda temporização via alarm callbacks.
  */
 
 #include <stdio.h>
@@ -41,8 +40,7 @@
 #define LED_GREEN  4
 #define LED_RED    5
 
-#define AUDIO_PIN  14
-
+#define AUDIO_PIN     14
 #define LCD_BACKLIGHT 15
 
 /* ── Tela (landscape) ──────────────────────────────────────────────────────── */
@@ -50,7 +48,7 @@
 #define SCREEN_W 320
 #define SCREEN_H 240
 
-/* ── Cores LCD (RGB565) ────────────────────────────────────────────────────── */
+/* ── Cores LCD ─────────────────────────────────────────────────────────────── */
 
 #define COLOR_BLACK   ILI9341_BLACK
 #define COLOR_WHITE   ILI9341_WHITE
@@ -59,24 +57,32 @@
 #define COLOR_BLUE    ILI9341_BLUE
 #define COLOR_YELLOW  ILI9341_YELLOW
 #define COLOR_CYAN    ILI9341_CYAN
+#define COLOR_ORANGE  ILI9341_ORANGE
 
-/* ── Cores (índices) ───────────────────────────────────────────────────────── */
+/* ── Cores (índices do jogo) ───────────────────────────────────────────────── */
 
 #define YELLOW 0
 #define BLUE   1
 #define GREEN  2
 #define RED    3
 
+/* ── Modos de jogo ─────────────────────────────────────────────────────────── */
+
+#define MODE_SOLO 0
+#define MODE_DUO  1
+
 /* ── Estados ───────────────────────────────────────────────────────────────── */
 
 typedef enum {
     ST_IDLE,
+    ST_SELECT_MODE,
     ST_SHOW_PRE,
     ST_SHOW_ON,
     ST_SHOW_OFF,
     ST_PLAYER,
     ST_FEEDBACK,
     ST_LEVEL_UP,
+    ST_SWITCH_PLAYER,
     ST_ERROR,
     ST_WAIT_START,
     ST_WIN,
@@ -84,30 +90,28 @@ typedef enum {
 
 /* ── Tempos (ms) ───────────────────────────────────────────────────────────── */
 
-#define PRE_SHOW_MS   1000
-#define LED_ON_MS      600
-#define LED_OFF_MS     250
-#define TIMEOUT_MS    5000
-#define FEEDBACK_MS    300
-#define LEVEL_UP_MS    800
-#define ERR_BLINK_MS   150
-#define ERR_BLINKS       5
-#define WIN_BLINK_MS   200
-#define WIN_BLINKS       4
+#define PRE_SHOW_MS    1000
+#define LED_ON_MS       600
+#define LED_OFF_MS      250
+#define TIMEOUT_MS     5000
+#define FEEDBACK_MS     300
+#define LEVEL_UP_MS     800
+#define SWITCH_MS      1200
+#define ERR_BLINK_MS    150
+#define ERR_BLINKS        5
+#define WIN_BLINK_MS    200
+#define WIN_BLINKS        4
 
 /* ── Sequência ─────────────────────────────────────────────────────────────── */
 
 #define SEQ_LEN 100
 static const int led_pins[4] = {LED_YELLOW, LED_BLUE, LED_GREEN, LED_RED};
 
-static void generate_sequence(int *seq) {
-    uint32_t s = time_us_32();
-    if (s == 0) s = 1;
+static void generate_sequence(int *seq, uint32_t seed) {
+    if (seed == 0) seed = 1;
     for (int i = 0; i < SEQ_LEN; i++) {
-        s ^= s << 13;
-        s ^= s >> 17;
-        s ^= s << 5;
-        seq[i] = (int)(s % 4);
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        seq[i] = (int)(seed % 4);
     }
 }
 
@@ -137,16 +141,8 @@ static struct {
     volatile uint32_t position;
 } s_audio = { .id = AUDIO_NONE, .position = 0 };
 
-static void audio_play(int audio_id) {
-    s_audio.position = 0;
-    s_audio.id       = audio_id;
-}
-
-static void audio_stop(void) {
-    s_audio.id       = AUDIO_NONE;
-    s_audio.position = 0;
-    pwm_set_gpio_level(AUDIO_PIN, 0);
-}
+static void audio_play(int audio_id) { s_audio.position = 0; s_audio.id = audio_id; }
+static void audio_stop(void) { s_audio.id = AUDIO_NONE; s_audio.position = 0; pwm_set_gpio_level(AUDIO_PIN, 0); }
 
 void pwm_interrupt_handler(void) {
     pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));
@@ -156,10 +152,7 @@ void pwm_interrupt_handler(void) {
     if (s_audio.position < total - 1) {
         pwm_set_gpio_level(AUDIO_PIN, audio_data[id][s_audio.position >> 3]);
         s_audio.position++;
-    } else {
-        s_audio.id = AUDIO_NONE;
-        pwm_set_gpio_level(AUDIO_PIN, 0);
-    }
+    } else { s_audio.id = AUDIO_NONE; pwm_set_gpio_level(AUDIO_PIN, 0); }
 }
 
 /* ── Variáveis de estado ───────────────────────────────────────────────────── */
@@ -174,6 +167,17 @@ static volatile int        blink_count    = 0;
 static volatile bool       start_pressed  = false;
 static volatile alarm_id_t timeout_id     = 0;
 static volatile uint32_t   last_btn_us    = 0;
+static volatile int        mode_choice    = -1;   // botão de seleção de modo
+
+/* ── Variáveis de jogo ─────────────────────────────────────────────────────── */
+
+static int  game_mode       = MODE_SOLO;
+static int  current_player  = 0;        // 0 ou 1
+static bool player_alive[2] = {true, true};
+static int  player_score[2] = {0, 0};
+static bool player_tried[2] = {false, false};  // quem já jogou nesta rodada
+
+/* ── Helpers ───────────────────────────────────────────────────────────────── */
 
 static void all_leds(bool on) {
     for (int i = 0; i < 4; i++) gpio_put(led_pins[i], on);
@@ -184,16 +188,41 @@ static int64_t cb_alarm(alarm_id_t id, void *data) {
     return 0;
 }
 
+// Encontra o próximo jogador vivo que ainda não jogou nesta rodada
+// Retorna -1 se não há
+static int find_next_untried_alive(void) {
+    for (int i = 0; i < 2; i++) {
+        if (player_alive[i] && !player_tried[i])
+            return i;
+    }
+    return -1;
+}
+
+static bool any_alive(void) {
+    return player_alive[0] || player_alive[1];
+}
+
+/* ── IRQ: botões ───────────────────────────────────────────────────────────── */
+
 static void btn_callback(uint gpio, uint32_t events) {
     uint32_t now = time_us_32();
     if (now - last_btn_us < 200000) return;
     last_btn_us = now;
     if (!(events & GPIO_IRQ_EDGE_FALL)) return;
+
     if (gpio == BTN_START) {
         if (state == ST_IDLE || state == ST_WAIT_START)
             start_pressed = true;
         return;
     }
+
+    // Seleção de modo
+    if (state == ST_SELECT_MODE) {
+        if (gpio == BTN_RED)  mode_choice = MODE_SOLO;
+        if (gpio == BTN_BLUE) mode_choice = MODE_DUO;
+        return;
+    }
+
     if (state != ST_PLAYER) return;
     switch (gpio) {
         case BTN_YELLOW: pressed_color = YELLOW; break;
@@ -223,7 +252,26 @@ static void lcd_show_idle(void) {
     gfx_print("para comecar!");
 }
 
-static void lcd_show_score(int level) {
+static void lcd_show_select_mode(void) {
+    lcd_clear();
+    gfx_setTextSize(2);
+    gfx_setTextColor(COLOR_WHITE);
+    gfx_setCursor(40, 30);
+    gfx_print("Escolha o modo:");
+
+    // Solo
+    gfx_setTextSize(2);
+    gfx_setTextColor(COLOR_RED);
+    gfx_setCursor(40, 90);
+    gfx_print("Vermelho: SOLO");
+
+    // Dupla
+    gfx_setTextColor(COLOR_BLUE);
+    gfx_setCursor(40, 140);
+    gfx_print("Azul: DUPLA");
+}
+
+static void lcd_show_score_solo(int level) {
     lcd_clear();
     gfx_setTextSize(2);
     gfx_setTextColor(COLOR_WHITE);
@@ -237,7 +285,57 @@ static void lcd_show_score(int level) {
     gfx_print(buf);
 }
 
-static void lcd_show_error(int final_score) {
+static void lcd_show_score_duo(int level, int player) {
+    lcd_clear();
+
+    // Cabeçalho: vez de quem
+    gfx_setTextSize(2);
+    uint16_t color = (player == 0) ? COLOR_CYAN : COLOR_ORANGE;
+    gfx_setTextColor(color);
+    char header[24];
+    snprintf(header, sizeof(header), "Vez: Jogador %d", player + 1);
+    gfx_setCursor(50, 20);
+    gfx_print(header);
+
+    // Nível atual
+    gfx_setTextSize(2);
+    gfx_setTextColor(COLOR_WHITE);
+    gfx_setCursor(90, 70);
+    gfx_print("Pontuacao:");
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", level - 1);
+    gfx_setTextSize(4);
+    gfx_setTextColor(COLOR_GREEN);
+    gfx_setCursor(135, 110);
+    gfx_print(buf);
+
+    // Status dos jogadores
+    gfx_setTextSize(1);
+    gfx_setTextColor(player_alive[0] ? COLOR_CYAN : COLOR_RED);
+    gfx_setCursor(30, 200);
+    gfx_print(player_alive[0] ? "J1: Vivo" : "J1: Eliminado");
+
+    gfx_setTextColor(player_alive[1] ? COLOR_ORANGE : COLOR_RED);
+    gfx_setCursor(200, 200);
+    gfx_print(player_alive[1] ? "J2: Vivo" : "J2: Eliminado");
+}
+
+static void lcd_show_turn(int player) {
+    lcd_clear();
+    gfx_setTextSize(3);
+    uint16_t color = (player == 0) ? COLOR_CYAN : COLOR_ORANGE;
+    gfx_setTextColor(color);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Jogador %d", player + 1);
+    gfx_setCursor(55, 70);
+    gfx_print(buf);
+    gfx_setTextSize(2);
+    gfx_setTextColor(COLOR_WHITE);
+    gfx_setCursor(85, 130);
+    gfx_print("Sua vez!");
+}
+
+static void lcd_show_error_solo(int final_score) {
     lcd_clear();
     gfx_setTextSize(3);
     gfx_setTextColor(COLOR_RED);
@@ -250,26 +348,89 @@ static void lcd_show_error(int final_score) {
     gfx_setCursor(80, 100);
     gfx_print(buf);
     gfx_setTextSize(1);
-    gfx_setCursor(70, 160);
+    gfx_setCursor(70, 170);
     gfx_print("Aperte START para");
-    gfx_setCursor(80, 180);
+    gfx_setCursor(80, 190);
     gfx_print("jogar novamente");
 }
 
-static void lcd_show_win(void) {
+static void lcd_show_error_duo_player(int player, int score) {
+    lcd_clear();
+    gfx_setTextSize(2);
+    uint16_t color = (player == 0) ? COLOR_CYAN : COLOR_ORANGE;
+    gfx_setTextColor(color);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Jogador %d", player + 1);
+    gfx_setCursor(70, 40);
+    gfx_print(buf);
+    gfx_setTextSize(3);
+    gfx_setTextColor(COLOR_RED);
+    gfx_setCursor(85, 80);
+    gfx_print("ERROU!");
+    snprintf(buf, sizeof(buf), "Score: %d", score);
+    gfx_setTextSize(2);
+    gfx_setTextColor(COLOR_WHITE);
+    gfx_setCursor(80, 140);
+    gfx_print(buf);
+}
+
+static void lcd_show_gameover_duo(void) {
+    lcd_clear();
+    gfx_setTextSize(2);
+    gfx_setTextColor(COLOR_WHITE);
+    gfx_setCursor(60, 20);
+    gfx_print("Fim de Jogo!");
+
+    char buf[24];
+
+    // Jogador 1
+    gfx_setTextColor(COLOR_CYAN);
+    snprintf(buf, sizeof(buf), "J1: %d pts", player_score[0]);
+    gfx_setCursor(70, 70);
+    gfx_print(buf);
+
+    // Jogador 2
+    gfx_setTextColor(COLOR_ORANGE);
+    snprintf(buf, sizeof(buf), "J2: %d pts", player_score[1]);
+    gfx_setCursor(70, 110);
+    gfx_print(buf);
+
+    // Vencedor
+    gfx_setTextSize(2);
+    gfx_setCursor(40, 160);
+    if (player_score[0] > player_score[1]) {
+        gfx_setTextColor(COLOR_CYAN);
+        gfx_print("Jogador 1 venceu!");
+    } else if (player_score[1] > player_score[0]) {
+        gfx_setTextColor(COLOR_ORANGE);
+        gfx_print("Jogador 2 venceu!");
+    } else {
+        gfx_setTextColor(COLOR_YELLOW);
+        gfx_print("  EMPATE!");
+    }
+
+    gfx_setTextSize(1);
+    gfx_setTextColor(COLOR_WHITE);
+    gfx_setCursor(70, 210);
+    gfx_print("Aperte START para");
+    gfx_setCursor(80, 225);
+    gfx_print("jogar novamente");
+}
+
+static void lcd_show_win_solo(void) {
     lcd_clear();
     gfx_setTextSize(3);
     gfx_setTextColor(COLOR_YELLOW);
-    gfx_setCursor(70, 40);
+    gfx_setCursor(70, 60);
     gfx_print("VITORIA!");
     gfx_setTextSize(2);
     gfx_setTextColor(COLOR_WHITE);
-    gfx_setCursor(80, 100);
+    gfx_setCursor(80, 120);
     gfx_print("Parabens!");
     gfx_setTextSize(1);
-    gfx_setCursor(70, 160);
+    gfx_setCursor(70, 180);
     gfx_print("Aperte START para");
-    gfx_setCursor(80, 180);
+    gfx_setCursor(80, 200);
     gfx_print("jogar novamente");
 }
 
@@ -311,14 +472,102 @@ static void setup(void) {
     LCD_setPins(22, 17, 16, 18, 19);
     LCD_setSPIperiph(spi0);
     LCD_initDisplay();
-    LCD_setRotation(1);  // landscape 90° horário
+    LCD_setRotation(1);
 
-    /* Backlight ON */
     gpio_init(LCD_BACKLIGHT);
     gpio_set_dir(LCD_BACKLIGHT, GPIO_OUT);
     gpio_put(LCD_BACKLIGHT, 1);
 
     gfx_init();
+}
+
+/* ── Helpers de transição ──────────────────────────────────────────────────── */
+
+static volatile bool alarm_fired = false;
+static int           sequence[2][SEQ_LEN];
+static int           last_displayed_level = -1;
+
+// Inicia a vez de current_player: mostra sequência
+static void start_player_round(void) {
+    player_tried[current_player] = true;
+    show_idx = 0;
+    state    = ST_SHOW_PRE;
+
+    if (game_mode == MODE_DUO)
+        lcd_show_score_duo(current_level, current_player);
+    else
+        lcd_show_score_solo(current_level);
+
+    last_displayed_level = current_level;
+    add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
+}
+
+// Após jogador acertar tudo do nível ou após erro, decide próximo passo
+static void after_player_success(void) {
+    if (game_mode == MODE_SOLO) {
+        if (current_level >= SEQ_LEN) {
+            audio_play(AUDIO_INICIO);
+            lcd_show_win_solo();
+            state = ST_WIN; blink_count = 0; all_leds(true);
+            add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
+        } else {
+            current_level++;
+            state = ST_LEVEL_UP;
+            add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
+        }
+        return;
+    }
+
+    // Duo: verifica se outro jogador precisa jogar
+    int next = find_next_untried_alive();
+    if (next >= 0) {
+        current_player = next;
+        lcd_show_turn(current_player);
+        state = ST_SWITCH_PLAYER;
+        add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
+    } else {
+        // Todos os vivos já jogaram — próximo nível
+        if (current_level >= SEQ_LEN) {
+            audio_play(AUDIO_INICIO);
+            lcd_show_win_solo();  // vitória mesmo em duo
+            state = ST_WIN; blink_count = 0; all_leds(true);
+            add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
+        } else {
+            current_level++;
+            state = ST_LEVEL_UP;
+            add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
+        }
+    }
+}
+
+static void after_error_animation(void) {
+    all_leds(false);
+    audio_stop();
+
+    if (game_mode == MODE_SOLO) {
+        current_level = 1;
+        state = ST_WAIT_START;
+        return;
+    }
+
+    // Duo: jogador já foi marcado como morto antes da animação
+    int next = find_next_untried_alive();
+    if (next >= 0) {
+        // Outro jogador ainda precisa jogar esta rodada
+        current_player = next;
+        lcd_show_turn(current_player);
+        state = ST_SWITCH_PLAYER;
+        add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
+    } else if (any_alive()) {
+        // Outro jogador já jogou esta rodada e sobreviveu — próximo nível
+        current_level++;
+        state = ST_LEVEL_UP;
+        add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
+    } else {
+        // Ambos eliminados
+        lcd_show_gameover_duo();
+        state = ST_WAIT_START;
+    }
 }
 
 /* ── Main ──────────────────────────────────────────────────────────────────── */
@@ -329,45 +578,73 @@ int main(void) {
     setup();
     lcd_show_idle();
 
-    int           sequence[SEQ_LEN];
-    volatile bool alarm_fired = false;
-    int           last_displayed_level = -1;
-
     while (true) {
 
+        /* ── START → tela de seleção de modo ── */
         if (start_pressed) {
             start_pressed = false;
-            generate_sequence(sequence);
-            current_level = 1;
-            all_leds(false);
-            audio_play(AUDIO_INICIO);
-            show_idx = 0;
-            state    = ST_SHOW_PRE;
-            last_displayed_level = -1;
-            lcd_show_score(current_level);
-            add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
+            mode_choice   = -1;
+            state         = ST_SELECT_MODE;
+            lcd_show_select_mode();
         }
 
-        if ((state >= ST_SHOW_PRE && state <= ST_LEVEL_UP) &&
+        /* ── Seleção de modo ── */
+        if (state == ST_SELECT_MODE && mode_choice >= 0) {
+            game_mode = mode_choice;
+            mode_choice = -1;
+
+            uint32_t seed = time_us_32();
+            generate_sequence(sequence[0], seed);
+            generate_sequence(sequence[1], seed ^ 0xDEADBEEF);
+            current_level  = 1;
+            current_player = 0;
+            player_alive[0] = true;
+            player_alive[1] = true;
+            player_score[0] = 0;
+            player_score[1] = 0;
+            player_tried[0] = false;
+            player_tried[1] = false;
+            all_leds(false);
+            audio_play(AUDIO_INICIO);
+            last_displayed_level = -1;
+
+            if (game_mode == MODE_DUO) {
+                lcd_show_turn(0);
+                state = ST_SWITCH_PLAYER;
+                add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
+            } else {
+                start_player_round();
+            }
+        }
+
+        /* ── Atualiza pontuação no LCD quando muda (solo) ── */
+        if (game_mode == MODE_SOLO &&
+            state >= ST_SHOW_PRE && state <= ST_LEVEL_UP &&
             current_level != last_displayed_level) {
-            lcd_show_score(current_level);
+            lcd_show_score_solo(current_level);
             last_displayed_level = current_level;
         }
 
+        /* ── Alarme disparou ── */
         if (alarm_fired) {
             alarm_fired = false;
 
             switch (state) {
 
+                case ST_SWITCH_PLAYER:
+                    // Após pausa mostrando de quem é a vez, inicia sequência
+                    start_player_round();
+                    break;
+
                 case ST_SHOW_PRE:
                     state = ST_SHOW_ON;
-                    gpio_put(led_pins[sequence[show_idx]], 1);
-                    audio_play(color_to_audio[sequence[show_idx]]);
+                    gpio_put(led_pins[sequence[current_player][show_idx]], 1);
+                    audio_play(color_to_audio[sequence[current_player][show_idx]]);
                     add_alarm_in_ms(LED_ON_MS, cb_alarm, (void*)&alarm_fired, false);
                     break;
 
                 case ST_SHOW_ON:
-                    gpio_put(led_pins[sequence[show_idx]], 0);
+                    gpio_put(led_pins[sequence[current_player][show_idx]], 0);
                     audio_stop();
                     show_idx++;
                     if (show_idx >= current_level) {
@@ -383,45 +660,44 @@ int main(void) {
 
                 case ST_SHOW_OFF:
                     state = ST_SHOW_ON;
-                    gpio_put(led_pins[sequence[show_idx]], 1);
-                    audio_play(color_to_audio[sequence[show_idx]]);
+                    gpio_put(led_pins[sequence[current_player][show_idx]], 1);
+                    audio_play(color_to_audio[sequence[current_player][show_idx]]);
                     add_alarm_in_ms(LED_ON_MS, cb_alarm, (void*)&alarm_fired, false);
                     break;
 
                 case ST_PLAYER:
+                    /* timeout esgotado = erro */
                     audio_play(AUDIO_FALHA);
-                    lcd_show_error(current_level - 1);
-                    state       = ST_ERROR;
-                    blink_count = 0;
-                    all_leds(true);
+                    player_alive[current_player] = false;
+                    player_score[current_player] = current_level - 1;
+                    if (game_mode == MODE_DUO)
+                        lcd_show_error_duo_player(current_player, player_score[current_player]);
+                    else
+                        lcd_show_error_solo(current_level - 1);
+                    state = ST_ERROR; blink_count = 0; all_leds(true);
                     add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
                     break;
 
                 case ST_FEEDBACK:
                     gpio_put(led_pins[feedback_color], 0);
                     audio_stop();
-                    if (feedback_color != sequence[player_idx]) {
+                    if (feedback_color != sequence[current_player][player_idx]) {
+                        /* ── Cor errada ── */
                         audio_play(AUDIO_FALHA);
-                        lcd_show_error(current_level - 1);
-                        state       = ST_ERROR;
-                        blink_count = 0;
-                        all_leds(true);
+                        player_alive[current_player] = false;
+                        player_score[current_player] = current_level - 1;
+                        if (game_mode == MODE_DUO)
+                            lcd_show_error_duo_player(current_player, player_score[current_player]);
+                        else
+                            lcd_show_error_solo(current_level - 1);
+                        state = ST_ERROR; blink_count = 0; all_leds(true);
                         add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
                     } else {
                         player_idx++;
                         if (player_idx >= current_level) {
-                            if (current_level >= SEQ_LEN) {
-                                audio_play(AUDIO_INICIO);
-                                lcd_show_win();
-                                state       = ST_WIN;
-                                blink_count = 0;
-                                all_leds(true);
-                                add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
-                            } else {
-                                current_level++;
-                                state = ST_LEVEL_UP;
-                                add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
-                            }
+                            /* Jogador completou o nível */
+                            player_score[current_player] = current_level;
+                            after_player_success();
                         } else {
                             state      = ST_PLAYER;
                             timeout_id = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, (void*)&alarm_fired, false);
@@ -431,18 +707,28 @@ int main(void) {
 
                 case ST_LEVEL_UP:
                     all_leds(false);
-                    show_idx = 0;
-                    state    = ST_SHOW_PRE;
-                    add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
+                    // Reset "tried" para a nova rodada
+                    player_tried[0] = false;
+                    player_tried[1] = false;
+
+                    if (game_mode == MODE_DUO) {
+                        // Encontra primeiro jogador vivo
+                        int first = find_next_untried_alive();
+                        if (first >= 0) {
+                            current_player = first;
+                            lcd_show_turn(current_player);
+                            state = ST_SWITCH_PLAYER;
+                            add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
+                        }
+                    } else {
+                        start_player_round();
+                    }
                     break;
 
                 case ST_ERROR:
                     blink_count++;
                     if (blink_count >= ERR_BLINKS * 2) {
-                        all_leds(false);
-                        audio_stop();
-                        current_level = 1;
-                        state         = ST_WAIT_START;
+                        after_error_animation();
                     } else {
                         all_leds(blink_count % 2 == 0);
                         add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
@@ -452,10 +738,9 @@ int main(void) {
                 case ST_WIN:
                     blink_count++;
                     if (blink_count >= WIN_BLINKS * 2) {
-                        all_leds(false);
-                        audio_stop();
+                        all_leds(false); audio_stop();
                         current_level = 1;
-                        state         = ST_WAIT_START;
+                        state = ST_WAIT_START;
                     } else {
                         all_leds(blink_count % 2 == 0);
                         add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
@@ -467,6 +752,7 @@ int main(void) {
             }
         }
 
+        /* ── Botão de cor durante ST_PLAYER ── */
         if (state == ST_PLAYER && pressed_color >= 0) {
             uint32_t ints = save_and_disable_interrupts();
             if (state != ST_PLAYER) {
