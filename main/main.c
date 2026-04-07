@@ -3,7 +3,7 @@
  *
  * Máquina de estados sem sleep_ms.
  * Toda temporização via alarm callbacks.
- * Áudio PWM + display ILI9341.
+ * Áudio PWM + display ILI9341 (landscape).
  */
 
 #include <stdio.h>
@@ -44,6 +44,11 @@
 #define AUDIO_PIN  14
 
 #define LCD_BACKLIGHT 15
+
+/* ── Tela (landscape) ──────────────────────────────────────────────────────── */
+
+#define SCREEN_W 320
+#define SCREEN_H 240
 
 /* ── Cores LCD (RGB565) ────────────────────────────────────────────────────── */
 
@@ -198,23 +203,23 @@ static void btn_callback(uint gpio, uint32_t events) {
     }
 }
 
-/* ── LCD helpers ───────────────────────────────────────────────────────────── */
+/* ── LCD helpers (320×240 landscape) ───────────────────────────────────────── */
 
 static void lcd_clear(void) {
-    gfx_fillRect(0, 0, 240, 320, COLOR_BLACK);
+    gfx_fillRect(0, 0, SCREEN_W, SCREEN_H, COLOR_BLACK);
 }
 
 static void lcd_show_idle(void) {
     lcd_clear();
     gfx_setTextSize(4);
     gfx_setTextColor(COLOR_CYAN);
-    gfx_setCursor(60, 80);
+    gfx_setCursor(88, 60);
     gfx_print("GENIUS");
     gfx_setTextSize(1);
     gfx_setTextColor(COLOR_WHITE);
-    gfx_setCursor(20, 160);
+    gfx_setCursor(60, 140);
     gfx_print("Aperte o botao preto");
-    gfx_setCursor(45, 180);
+    gfx_setCursor(85, 160);
     gfx_print("para comecar!");
 }
 
@@ -222,13 +227,13 @@ static void lcd_show_score(int level) {
     lcd_clear();
     gfx_setTextSize(2);
     gfx_setTextColor(COLOR_WHITE);
-    gfx_setCursor(50, 40);
+    gfx_setCursor(90, 40);
     gfx_print("Pontuacao:");
     char buf[8];
     snprintf(buf, sizeof(buf), "%d", level - 1);
     gfx_setTextSize(5);
     gfx_setTextColor(COLOR_GREEN);
-    gfx_setCursor(100, 100);
+    gfx_setCursor(140, 100);
     gfx_print(buf);
 }
 
@@ -236,18 +241,18 @@ static void lcd_show_error(int final_score) {
     lcd_clear();
     gfx_setTextSize(3);
     gfx_setTextColor(COLOR_RED);
-    gfx_setCursor(50, 60);
+    gfx_setCursor(100, 40);
     gfx_print("ERROU!");
     char buf[16];
     snprintf(buf, sizeof(buf), "Score: %d", final_score);
     gfx_setTextSize(2);
     gfx_setTextColor(COLOR_WHITE);
-    gfx_setCursor(40, 120);
+    gfx_setCursor(80, 100);
     gfx_print(buf);
     gfx_setTextSize(1);
-    gfx_setCursor(20, 180);
+    gfx_setCursor(70, 160);
     gfx_print("Aperte START para");
-    gfx_setCursor(30, 200);
+    gfx_setCursor(80, 180);
     gfx_print("jogar novamente");
 }
 
@@ -255,16 +260,16 @@ static void lcd_show_win(void) {
     lcd_clear();
     gfx_setTextSize(3);
     gfx_setTextColor(COLOR_YELLOW);
-    gfx_setCursor(30, 60);
+    gfx_setCursor(70, 40);
     gfx_print("VITORIA!");
     gfx_setTextSize(2);
     gfx_setTextColor(COLOR_WHITE);
-    gfx_setCursor(20, 120);
+    gfx_setCursor(80, 100);
     gfx_print("Parabens!");
     gfx_setTextSize(1);
-    gfx_setCursor(20, 180);
+    gfx_setCursor(70, 160);
     gfx_print("Aperte START para");
-    gfx_setCursor(30, 200);
+    gfx_setCursor(80, 180);
     gfx_print("jogar novamente");
 }
 
@@ -303,10 +308,10 @@ static void setup(void) {
     pwm_set_gpio_level(AUDIO_PIN, 0);
 
     /* LCD */
-    LCD_setPins(22, 17, 16, 18, 19);  // DC, CS, RST, SCK, TX
+    LCD_setPins(22, 17, 16, 18, 19);
     LCD_setSPIperiph(spi0);
     LCD_initDisplay();
-    LCD_setRotation(0);
+    LCD_setRotation(1);  // landscape 90° horário
 
     /* Backlight ON */
     gpio_init(LCD_BACKLIGHT);
