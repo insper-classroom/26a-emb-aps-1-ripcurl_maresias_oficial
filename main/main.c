@@ -188,7 +188,7 @@ static int64_t cb_alarm(alarm_id_t id, void *data) {
     return 0;
 }
 
-static int find_next_untried_alive(bool *tried) {
+static int find_next_untried_alive(const bool *tried) {
     for (int i = 0; i < 2; i++)
         if (player_alive[i] && !tried[i]) return i;
     return -1;
@@ -658,41 +658,36 @@ int main(void) {
             }
 
             /* Seleção de modo */
-            else if (state == ST_SELECT_MODE) {
-                int chosen = -1;
-                if (btn == BTN_RED)  chosen = MODE_SOLO;
-                if (btn == BTN_BLUE) chosen = MODE_DUO;
+            else if (state == ST_SELECT_MODE &&
+                     (btn == BTN_RED || btn == BTN_BLUE)) {
+                game_mode = (btn == BTN_RED) ? MODE_SOLO : MODE_DUO;
+                uint32_t seed = time_us_32();
+                generate_sequence(sequence[0], seed);
+                generate_sequence(sequence[1], seed ^ 0xDEADBEEF);
 
-                if (chosen >= 0) {
-                    game_mode = chosen;
-                    uint32_t seed = time_us_32();
-                    generate_sequence(sequence[0], seed);
-                    generate_sequence(sequence[1], seed ^ 0xDEADBEEF);
+                current_level  = 1;
+                current_player = 0;
+                player_alive[0] = true;
+                player_alive[1] = true;
+                player_score[0] = 0;
+                player_score[1] = 0;
+                player_tried[0] = false;
+                player_tried[1] = false;
+                all_leds(false);
+                audio_play(AUDIO_INICIO);
+                last_displayed_level = -1;
 
-                    current_level  = 1;
-                    current_player = 0;
-                    player_alive[0] = true;
-                    player_alive[1] = true;
-                    player_score[0] = 0;
-                    player_score[1] = 0;
-                    player_tried[0] = false;
-                    player_tried[1] = false;
-                    all_leds(false);
-                    audio_play(AUDIO_INICIO);
-                    last_displayed_level = -1;
-
-                    if (game_mode == MODE_DUO) {
-                        lcd_show_turn(0);
-                        state = ST_SWITCH_PLAYER;
-                        add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
-                    } else {
-                        player_tried[0] = true;
-                        show_idx = 0;
-                        state    = ST_SHOW_PRE;
-                        lcd_show_score_solo(current_level);
-                        last_displayed_level = current_level;
-                        add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
-                    }
+                if (game_mode == MODE_DUO) {
+                    lcd_show_turn(0);
+                    state = ST_SWITCH_PLAYER;
+                    add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
+                } else {
+                    player_tried[0] = true;
+                    show_idx = 0;
+                    state    = ST_SHOW_PRE;
+                    lcd_show_score_solo(current_level);
+                    last_displayed_level = current_level;
+                    add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
                 }
             }
 
