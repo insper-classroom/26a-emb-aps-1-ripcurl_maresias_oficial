@@ -144,6 +144,7 @@ static struct {
 static void audio_play(int audio_id) { s_audio.position = 0; s_audio.id = audio_id; }
 static void audio_stop(void) { s_audio.id = AUDIO_NONE; s_audio.position = 0; pwm_set_gpio_level(AUDIO_PIN, 0); }
 
+// IRQ PWM — reproduz áudio
 void pwm_interrupt_handler(void) {
     pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));
     int id = s_audio.id;
@@ -155,27 +156,26 @@ void pwm_interrupt_handler(void) {
     } else { s_audio.id = AUDIO_NONE; pwm_set_gpio_level(AUDIO_PIN, 0); }
 }
 
-/* ── Variáveis de estado ───────────────────────────────────────────────────── */
+/* ── Variáveis globais — somente as compartilhadas com IRQ/callbacks ───────── */
 
-static volatile state_t    state          = ST_IDLE;
-static volatile int        current_level  = 1;
-static volatile int        show_idx       = 0;
-static volatile int        player_idx     = 0;
-static volatile int        pressed_color  = -1;
-static volatile int        feedback_color = -1;
-static volatile int        blink_count    = 0;
-static volatile bool       start_pressed  = false;
-static volatile alarm_id_t timeout_id     = 0;
-static volatile uint32_t   last_btn_us    = 0;
-static volatile int        mode_choice    = -1;   // botão de seleção de modo
+// Botão pressionado (gravado pela IRQ, consumido pelo main)
+volatile int       btn_event      = -1;
+volatile uint32_t  last_btn_us    = 0;
 
-/* ── Variáveis de jogo ─────────────────────────────────────────────────────── */
+// Alarme (gravado pelo callback, consumido pelo main)
+volatile bool      alarm_fired    = false;
+
+// Feedback e timeout (usados entre main e IRQ/alarm)
+volatile int       feedback_color = -1;
+volatile alarm_id_t timeout_id    = 0;
+
+/* ── Variáveis de jogo (globais, compartilhadas com IRQ indiretamente) ───── */
 
 static int  game_mode       = MODE_SOLO;
-static int  current_player  = 0;        // 0 ou 1
 static bool player_alive[2] = {true, true};
 static int  player_score[2] = {0, 0};
-static bool player_tried[2] = {false, false};  // quem já jogou nesta rodada
+static int  player_idx      = 0;
+static int  sequence[2][SEQ_LEN];
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
 
@@ -188,13 +188,9 @@ static int64_t cb_alarm(alarm_id_t id, void *data) {
     return 0;
 }
 
-// Encontra o próximo jogador vivo que ainda não jogou nesta rodada
-// Retorna -1 se não há
-static int find_next_untried_alive(void) {
-    for (int i = 0; i < 2; i++) {
-        if (player_alive[i] && !player_tried[i])
-            return i;
-    }
+static int find_next_untried_alive(bool *tried) {
+    for (int i = 0; i < 2; i++)
+        if (player_alive[i] && !tried[i]) return i;
     return -1;
 }
 
@@ -202,34 +198,14 @@ static bool any_alive(void) {
     return player_alive[0] || player_alive[1];
 }
 
-/* ── IRQ: botões ───────────────────────────────────────────────────────────── */
+/* ── IRQ: botão — apenas grava qual GPIO foi pressionado ───────────────────── */
 
 static void btn_callback(uint gpio, uint32_t events) {
     uint32_t now = time_us_32();
     if (now - last_btn_us < 200000) return;
     last_btn_us = now;
     if (!(events & GPIO_IRQ_EDGE_FALL)) return;
-
-    if (gpio == BTN_START) {
-        if (state == ST_IDLE || state == ST_WAIT_START)
-            start_pressed = true;
-        return;
-    }
-
-    // Seleção de modo
-    if (state == ST_SELECT_MODE) {
-        if (gpio == BTN_RED)  mode_choice = MODE_SOLO;
-        if (gpio == BTN_BLUE) mode_choice = MODE_DUO;
-        return;
-    }
-
-    if (state != ST_PLAYER) return;
-    switch (gpio) {
-        case BTN_YELLOW: pressed_color = YELLOW; break;
-        case BTN_BLUE:   pressed_color = BLUE;   break;
-        case BTN_GREEN:  pressed_color = GREEN;  break;
-        case BTN_RED:    pressed_color = RED;     break;
-    }
+    btn_event = (int)gpio;
 }
 
 /* ── LCD helpers (320×240 landscape) ───────────────────────────────────────── */
@@ -258,14 +234,9 @@ static void lcd_show_select_mode(void) {
     gfx_setTextColor(COLOR_WHITE);
     gfx_setCursor(40, 30);
     gfx_print("Escolha o modo:");
-
-    // Solo
-    gfx_setTextSize(2);
     gfx_setTextColor(COLOR_RED);
     gfx_setCursor(40, 90);
     gfx_print("Vermelho: SOLO");
-
-    // Dupla
     gfx_setTextColor(COLOR_BLUE);
     gfx_setCursor(40, 140);
     gfx_print("Azul: DUPLA");
@@ -287,18 +258,13 @@ static void lcd_show_score_solo(int level) {
 
 static void lcd_show_score_duo(int level, int player) {
     lcd_clear();
-
-    // Cabeçalho: vez de quem
-    gfx_setTextSize(2);
     uint16_t color = (player == 0) ? COLOR_CYAN : COLOR_ORANGE;
+    gfx_setTextSize(2);
     gfx_setTextColor(color);
     char header[24];
     snprintf(header, sizeof(header), "Vez: Jogador %d", player + 1);
     gfx_setCursor(50, 20);
     gfx_print(header);
-
-    // Nível atual
-    gfx_setTextSize(2);
     gfx_setTextColor(COLOR_WHITE);
     gfx_setCursor(90, 70);
     gfx_print("Pontuacao:");
@@ -308,13 +274,10 @@ static void lcd_show_score_duo(int level, int player) {
     gfx_setTextColor(COLOR_GREEN);
     gfx_setCursor(135, 110);
     gfx_print(buf);
-
-    // Status dos jogadores
     gfx_setTextSize(1);
     gfx_setTextColor(player_alive[0] ? COLOR_CYAN : COLOR_RED);
     gfx_setCursor(30, 200);
     gfx_print(player_alive[0] ? "J1: Vivo" : "J1: Eliminado");
-
     gfx_setTextColor(player_alive[1] ? COLOR_ORANGE : COLOR_RED);
     gfx_setCursor(200, 200);
     gfx_print(player_alive[1] ? "J2: Vivo" : "J2: Eliminado");
@@ -322,8 +285,8 @@ static void lcd_show_score_duo(int level, int player) {
 
 static void lcd_show_turn(int player) {
     lcd_clear();
-    gfx_setTextSize(3);
     uint16_t color = (player == 0) ? COLOR_CYAN : COLOR_ORANGE;
+    gfx_setTextSize(3);
     gfx_setTextColor(color);
     char buf[24];
     snprintf(buf, sizeof(buf), "Jogador %d", player + 1);
@@ -356,8 +319,8 @@ static void lcd_show_error_solo(int final_score) {
 
 static void lcd_show_error_duo_player(int player, int score) {
     lcd_clear();
-    gfx_setTextSize(2);
     uint16_t color = (player == 0) ? COLOR_CYAN : COLOR_ORANGE;
+    gfx_setTextSize(2);
     gfx_setTextColor(color);
     char buf[24];
     snprintf(buf, sizeof(buf), "Jogador %d", player + 1);
@@ -380,22 +343,15 @@ static void lcd_show_gameover_duo(void) {
     gfx_setTextColor(COLOR_WHITE);
     gfx_setCursor(60, 20);
     gfx_print("Fim de Jogo!");
-
     char buf[24];
-
-    // Jogador 1
     gfx_setTextColor(COLOR_CYAN);
     snprintf(buf, sizeof(buf), "J1: %d pts", player_score[0]);
     gfx_setCursor(70, 70);
     gfx_print(buf);
-
-    // Jogador 2
     gfx_setTextColor(COLOR_ORANGE);
     snprintf(buf, sizeof(buf), "J2: %d pts", player_score[1]);
     gfx_setCursor(70, 110);
     gfx_print(buf);
-
-    // Vencedor
     gfx_setTextSize(2);
     gfx_setCursor(40, 160);
     if (player_score[0] > player_score[1]) {
@@ -408,7 +364,6 @@ static void lcd_show_gameover_duo(void) {
         gfx_setTextColor(COLOR_YELLOW);
         gfx_print("  EMPATE!");
     }
-
     gfx_setTextSize(1);
     gfx_setTextColor(COLOR_WHITE);
     gfx_setCursor(70, 210);
@@ -473,101 +428,10 @@ static void setup(void) {
     LCD_setSPIperiph(spi0);
     LCD_initDisplay();
     LCD_setRotation(1);
-
     gpio_init(LCD_BACKLIGHT);
     gpio_set_dir(LCD_BACKLIGHT, GPIO_OUT);
     gpio_put(LCD_BACKLIGHT, 1);
-
     gfx_init();
-}
-
-/* ── Helpers de transição ──────────────────────────────────────────────────── */
-
-static volatile bool alarm_fired = false;
-static int           sequence[2][SEQ_LEN];
-static int           last_displayed_level = -1;
-
-// Inicia a vez de current_player: mostra sequência
-static void start_player_round(void) {
-    player_tried[current_player] = true;
-    show_idx = 0;
-    state    = ST_SHOW_PRE;
-
-    if (game_mode == MODE_DUO)
-        lcd_show_score_duo(current_level, current_player);
-    else
-        lcd_show_score_solo(current_level);
-
-    last_displayed_level = current_level;
-    add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
-}
-
-// Após jogador acertar tudo do nível ou após erro, decide próximo passo
-static void after_player_success(void) {
-    if (game_mode == MODE_SOLO) {
-        if (current_level >= SEQ_LEN) {
-            audio_play(AUDIO_INICIO);
-            lcd_show_win_solo();
-            state = ST_WIN; blink_count = 0; all_leds(true);
-            add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
-        } else {
-            current_level++;
-            state = ST_LEVEL_UP;
-            add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
-        }
-        return;
-    }
-
-    // Duo: verifica se outro jogador precisa jogar
-    int next = find_next_untried_alive();
-    if (next >= 0) {
-        current_player = next;
-        lcd_show_turn(current_player);
-        state = ST_SWITCH_PLAYER;
-        add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
-    } else {
-        // Todos os vivos já jogaram — próximo nível
-        if (current_level >= SEQ_LEN) {
-            audio_play(AUDIO_INICIO);
-            lcd_show_win_solo();  // vitória mesmo em duo
-            state = ST_WIN; blink_count = 0; all_leds(true);
-            add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
-        } else {
-            current_level++;
-            state = ST_LEVEL_UP;
-            add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
-        }
-    }
-}
-
-static void after_error_animation(void) {
-    all_leds(false);
-    audio_stop();
-
-    if (game_mode == MODE_SOLO) {
-        current_level = 1;
-        state = ST_WAIT_START;
-        return;
-    }
-
-    // Duo: jogador já foi marcado como morto antes da animação
-    int next = find_next_untried_alive();
-    if (next >= 0) {
-        // Outro jogador ainda precisa jogar esta rodada
-        current_player = next;
-        lcd_show_turn(current_player);
-        state = ST_SWITCH_PLAYER;
-        add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
-    } else if (any_alive()) {
-        // Outro jogador já jogou esta rodada e sobreviveu — próximo nível
-        current_level++;
-        state = ST_LEVEL_UP;
-        add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
-    } else {
-        // Ambos eliminados
-        lcd_show_gameover_duo();
-        state = ST_WAIT_START;
-    }
 }
 
 /* ── Main ──────────────────────────────────────────────────────────────────── */
@@ -578,62 +442,36 @@ int main(void) {
     setup();
     lcd_show_idle();
 
+    // Variáveis locais do jogo (não precisam ser globais)
+    state_t state              = ST_IDLE;
+    int     current_level      = 1;
+    int     show_idx           = 0;
+    int     blink_count        = 0;
+    int     current_player     = 0;
+    bool    player_tried[2]    = {false, false};
+    int     last_displayed_level = -1;
+
     while (true) {
 
-        /* ── START → tela de seleção de modo ── */
-        if (start_pressed) {
-            start_pressed = false;
-            mode_choice   = -1;
-            state         = ST_SELECT_MODE;
-            lcd_show_select_mode();
-        }
-
-        /* ── Seleção de modo ── */
-        if (state == ST_SELECT_MODE && mode_choice >= 0) {
-            game_mode = mode_choice;
-            mode_choice = -1;
-
-            uint32_t seed = time_us_32();
-            generate_sequence(sequence[0], seed);
-            generate_sequence(sequence[1], seed ^ 0xDEADBEEF);
-            current_level  = 1;
-            current_player = 0;
-            player_alive[0] = true;
-            player_alive[1] = true;
-            player_score[0] = 0;
-            player_score[1] = 0;
-            player_tried[0] = false;
-            player_tried[1] = false;
-            all_leds(false);
-            audio_play(AUDIO_INICIO);
-            last_displayed_level = -1;
-
-            if (game_mode == MODE_DUO) {
-                lcd_show_turn(0);
-                state = ST_SWITCH_PLAYER;
-                add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
-            } else {
-                start_player_round();
-            }
-        }
-
-        /* ── Atualiza pontuação no LCD quando muda (solo) ── */
-        if (game_mode == MODE_SOLO &&
-            state >= ST_SHOW_PRE && state <= ST_LEVEL_UP &&
-            current_level != last_displayed_level) {
-            lcd_show_score_solo(current_level);
-            last_displayed_level = current_level;
-        }
-
-        /* ── Alarme disparou ── */
+        /* ══════════════════════════════════════════════════════════════════ *
+         *  1. Processa alarmes (prioridade sobre botões)                    *
+         * ══════════════════════════════════════════════════════════════════ */
         if (alarm_fired) {
             alarm_fired = false;
 
             switch (state) {
 
                 case ST_SWITCH_PLAYER:
-                    // Após pausa mostrando de quem é a vez, inicia sequência
-                    start_player_round();
+                    // Inicia sequência para o jogador atual
+                    player_tried[current_player] = true;
+                    show_idx = 0;
+                    state    = ST_SHOW_PRE;
+                    if (game_mode == MODE_DUO)
+                        lcd_show_score_duo(current_level, current_player);
+                    else
+                        lcd_show_score_solo(current_level);
+                    last_displayed_level = current_level;
+                    add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
                     break;
 
                 case ST_SHOW_PRE:
@@ -648,10 +486,9 @@ int main(void) {
                     audio_stop();
                     show_idx++;
                     if (show_idx >= current_level) {
-                        player_idx    = 0;
-                        pressed_color = -1;
-                        state         = ST_PLAYER;
-                        timeout_id    = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, (void*)&alarm_fired, false);
+                        player_idx = 0;
+                        state      = ST_PLAYER;
+                        timeout_id = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, (void*)&alarm_fired, false);
                     } else {
                         state = ST_SHOW_OFF;
                         add_alarm_in_ms(LED_OFF_MS, cb_alarm, (void*)&alarm_fired, false);
@@ -666,7 +503,7 @@ int main(void) {
                     break;
 
                 case ST_PLAYER:
-                    /* timeout esgotado = erro */
+                    /* timeout = erro */
                     audio_play(AUDIO_FALHA);
                     player_alive[current_player] = false;
                     player_score[current_player] = current_level - 1;
@@ -697,7 +534,37 @@ int main(void) {
                         if (player_idx >= current_level) {
                             /* Jogador completou o nível */
                             player_score[current_player] = current_level;
-                            after_player_success();
+
+                            if (game_mode == MODE_SOLO) {
+                                if (current_level >= SEQ_LEN) {
+                                    audio_play(AUDIO_INICIO);
+                                    lcd_show_win_solo();
+                                    state = ST_WIN; blink_count = 0; all_leds(true);
+                                    add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
+                                } else {
+                                    current_level++;
+                                    state = ST_LEVEL_UP;
+                                    add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
+                                }
+                            } else {
+                                /* Duo: verifica se outro jogador precisa jogar */
+                                int next = find_next_untried_alive(player_tried);
+                                if (next >= 0) {
+                                    current_player = next;
+                                    lcd_show_turn(current_player);
+                                    state = ST_SWITCH_PLAYER;
+                                    add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
+                                } else if (current_level >= SEQ_LEN) {
+                                    audio_play(AUDIO_INICIO);
+                                    lcd_show_win_solo();
+                                    state = ST_WIN; blink_count = 0; all_leds(true);
+                                    add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
+                                } else {
+                                    current_level++;
+                                    state = ST_LEVEL_UP;
+                                    add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
+                                }
+                            }
                         } else {
                             state      = ST_PLAYER;
                             timeout_id = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, (void*)&alarm_fired, false);
@@ -707,13 +574,11 @@ int main(void) {
 
                 case ST_LEVEL_UP:
                     all_leds(false);
-                    // Reset "tried" para a nova rodada
                     player_tried[0] = false;
                     player_tried[1] = false;
 
                     if (game_mode == MODE_DUO) {
-                        // Encontra primeiro jogador vivo
-                        int first = find_next_untried_alive();
+                        int first = find_next_untried_alive(player_tried);
                         if (first >= 0) {
                             current_player = first;
                             lcd_show_turn(current_player);
@@ -721,14 +586,41 @@ int main(void) {
                             add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
                         }
                     } else {
-                        start_player_round();
+                        // Solo: inicia sequência direto
+                        player_tried[current_player] = true;
+                        show_idx = 0;
+                        state    = ST_SHOW_PRE;
+                        lcd_show_score_solo(current_level);
+                        last_displayed_level = current_level;
+                        add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
                     }
                     break;
 
                 case ST_ERROR:
                     blink_count++;
                     if (blink_count >= ERR_BLINKS * 2) {
-                        after_error_animation();
+                        all_leds(false);
+                        audio_stop();
+
+                        if (game_mode == MODE_SOLO) {
+                            current_level = 1;
+                            state = ST_WAIT_START;
+                        } else {
+                            int next = find_next_untried_alive(player_tried);
+                            if (next >= 0) {
+                                current_player = next;
+                                lcd_show_turn(current_player);
+                                state = ST_SWITCH_PLAYER;
+                                add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
+                            } else if (any_alive()) {
+                                current_level++;
+                                state = ST_LEVEL_UP;
+                                add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
+                            } else {
+                                lcd_show_gameover_duo();
+                                state = ST_WAIT_START;
+                            }
+                        }
                     } else {
                         all_leds(blink_count % 2 == 0);
                         add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
@@ -752,22 +644,89 @@ int main(void) {
             }
         }
 
-        /* ── Botão de cor durante ST_PLAYER ── */
-        if (state == ST_PLAYER && pressed_color >= 0) {
-            uint32_t ints = save_and_disable_interrupts();
-            if (state != ST_PLAYER) {
-                pressed_color = -1;
-                restore_interrupts(ints);
-            } else {
-                feedback_color = pressed_color;
-                pressed_color  = -1;
-                state          = ST_FEEDBACK;
-                cancel_alarm(timeout_id);
-                restore_interrupts(ints);
-                gpio_put(led_pins[feedback_color], 1);
-                audio_play(color_to_audio[feedback_color]);
-                add_alarm_in_ms(FEEDBACK_MS, cb_alarm, (void*)&alarm_fired, false);
+        /* ══════════════════════════════════════════════════════════════════ *
+         *  2. Processa botão (após alarmes)                                 *
+         * ══════════════════════════════════════════════════════════════════ */
+        int btn = btn_event;
+        if (btn >= 0) {
+            btn_event = -1;
+
+            /* START → vai para seleção de modo */
+            if (btn == BTN_START && (state == ST_IDLE || state == ST_WAIT_START)) {
+                state = ST_SELECT_MODE;
+                lcd_show_select_mode();
             }
+
+            /* Seleção de modo */
+            else if (state == ST_SELECT_MODE) {
+                int chosen = -1;
+                if (btn == BTN_RED)  chosen = MODE_SOLO;
+                if (btn == BTN_BLUE) chosen = MODE_DUO;
+
+                if (chosen >= 0) {
+                    game_mode = chosen;
+                    uint32_t seed = time_us_32();
+                    generate_sequence(sequence[0], seed);
+                    generate_sequence(sequence[1], seed ^ 0xDEADBEEF);
+
+                    current_level  = 1;
+                    current_player = 0;
+                    player_alive[0] = true;
+                    player_alive[1] = true;
+                    player_score[0] = 0;
+                    player_score[1] = 0;
+                    player_tried[0] = false;
+                    player_tried[1] = false;
+                    all_leds(false);
+                    audio_play(AUDIO_INICIO);
+                    last_displayed_level = -1;
+
+                    if (game_mode == MODE_DUO) {
+                        lcd_show_turn(0);
+                        state = ST_SWITCH_PLAYER;
+                        add_alarm_in_ms(SWITCH_MS, cb_alarm, (void*)&alarm_fired, false);
+                    } else {
+                        player_tried[0] = true;
+                        show_idx = 0;
+                        state    = ST_SHOW_PRE;
+                        lcd_show_score_solo(current_level);
+                        last_displayed_level = current_level;
+                        add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
+                    }
+                }
+            }
+
+            /* Cor durante ST_PLAYER */
+            else if (state == ST_PLAYER) {
+                int color = -1;
+                switch (btn) {
+                    case BTN_YELLOW: color = YELLOW; break;
+                    case BTN_BLUE:   color = BLUE;   break;
+                    case BTN_GREEN:  color = GREEN;  break;
+                    case BTN_RED:    color = RED;     break;
+                }
+                if (color >= 0) {
+                    uint32_t ints = save_and_disable_interrupts();
+                    feedback_color = color;
+                    state          = ST_FEEDBACK;
+                    cancel_alarm(timeout_id);
+                    restore_interrupts(ints);
+
+                    gpio_put(led_pins[feedback_color], 1);
+                    audio_play(color_to_audio[feedback_color]);
+                    add_alarm_in_ms(FEEDBACK_MS, cb_alarm, (void*)&alarm_fired, false);
+                }
+            }
+        }
+
+        /* ══════════════════════════════════════════════════════════════════ *
+         *  3. Atualiza LCD quando nível muda (solo)                         *
+         * ══════════════════════════════════════════════════════════════════ */
+        if (game_mode == MODE_SOLO &&
+            state >= ST_SHOW_PRE && state <= ST_LEVEL_UP &&
+            current_level != last_displayed_level) {
+            lcd_show_score_solo(current_level);
+            last_displayed_level = current_level;
         }
 
         __wfi();
