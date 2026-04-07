@@ -81,27 +81,19 @@ typedef enum {
 /* ── Sequência ─────────────────────────────────────────────────────────────── */
 
 #define SEQ_LEN 6
-static int       sequence[SEQ_LEN];
 static const int led_pins[4] = {LED_YELLOW, LED_BLUE, LED_GREEN, LED_RED};
 
 /* ── PRNG simples (xorshift32) ─────────────────────────────────────────────── */
 
-static uint32_t rng_state = 0;
-
-static uint32_t xorshift32(void) {
-    uint32_t x = rng_state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    rng_state = x;
-    return x;
-}
-
-static void generate_sequence(void) {
-    rng_state = time_us_32();
-    if (rng_state == 0) rng_state = 1;
-    for (int i = 0; i < SEQ_LEN; i++)
-        sequence[i] = xorshift32() % 4;
+static void generate_sequence(int *seq) {
+    uint32_t state = time_us_32();
+    if (state == 0) state = 1;
+    for (int i = 0; i < SEQ_LEN; i++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        seq[i] = (int)(state % 4);
+    }
 }
 
 /* ── Áudio: identificadores ────────────────────────────────────────────────── */
@@ -144,19 +136,21 @@ static const int color_to_audio[] = {
 
 /* ── Variáveis de áudio (volatile: acessadas na IRQ PWM) ──────────────────── */
 
-volatile int      current_audio = AUDIO_NONE;  // qual áudio está tocando
-volatile uint32_t wav_position  = 0;           // posição no áudio (com repetição 8x)
+static struct {
+    volatile int      id;        // qual áudio está tocando
+    volatile uint32_t position;  // posição no áudio (com repetição 8x)
+} s_audio = { .id = AUDIO_NONE, .position = 0 };
 
 /* ── Função para iniciar um áudio ──────────────────────────────────────────── */
 
 static void audio_play(int audio_id) {
-    wav_position  = 0;
-    current_audio = audio_id;
+    s_audio.position = 0;
+    s_audio.id       = audio_id;
 }
 
 static void audio_stop(void) {
-    current_audio = AUDIO_NONE;
-    wav_position  = 0;
+    s_audio.id       = AUDIO_NONE;
+    s_audio.position = 0;
     pwm_set_gpio_level(AUDIO_PIN, 0);
 }
 
@@ -165,19 +159,19 @@ static void audio_stop(void) {
 void pwm_interrupt_handler(void) {
     pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));
 
-    int id = current_audio;
+    int id = s_audio.id;
     if (id == AUDIO_NONE) {
         pwm_set_gpio_level(AUDIO_PIN, 0);
         return;
     }
 
     uint32_t total = audio_length[id] << 3;  // cada amostra repete 8 ciclos
-    if (wav_position < total - 1) {
-        pwm_set_gpio_level(AUDIO_PIN, audio_data[id][wav_position >> 3]);
-        wav_position++;
+    if (s_audio.position < total - 1) {
+        pwm_set_gpio_level(AUDIO_PIN, audio_data[id][s_audio.position >> 3]);
+        s_audio.position++;
     } else {
         // áudio terminou: silencia (não faz loop)
-        current_audio = AUDIO_NONE;
+        s_audio.id = AUDIO_NONE;
         pwm_set_gpio_level(AUDIO_PIN, 0);
     }
 }
@@ -192,7 +186,6 @@ static volatile int        pressed_color  = -1;
 static volatile int        feedback_color = -1;
 static volatile int        blink_count    = 0;
 static volatile bool       start_pressed  = false;
-static volatile bool       alarm_fired    = false;
 static volatile alarm_id_t timeout_id     = 0;
 static volatile uint32_t   last_btn_us    = 0;
 
@@ -206,7 +199,7 @@ static void all_leds(bool on) {
 /* ── Callback de alarme — apenas sinaliza o main ───────────────────────────── */
 
 static int64_t cb_alarm(alarm_id_t id, void *data) {
-    alarm_fired = true;
+    *(volatile bool *)data = true;
     return 0;
 }
 
@@ -285,18 +278,21 @@ int main(void) {
     set_sys_clock_khz(176000, true);  // clock base para o PWM de áudio
     setup();
 
+    int           sequence[SEQ_LEN];
+    volatile bool alarm_fired = false;
+
     while (true) {
 
         /* ── START pressionado ── */
         if (start_pressed) {
             start_pressed = false;
-            generate_sequence();
+            generate_sequence(sequence);
             current_level = 1;
             all_leds(false);
             audio_play(AUDIO_INICIO);   // toca som de início
             show_idx = 0;
             state    = ST_SHOW_PRE;
-            add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, NULL, false);
+            add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
         }
 
         /* ── Alarme disparou: processa estado atual ── */
@@ -309,7 +305,7 @@ int main(void) {
                     state = ST_SHOW_ON;
                     gpio_put(led_pins[sequence[show_idx]], 1);
                     audio_play(color_to_audio[sequence[show_idx]]);  // som da cor
-                    add_alarm_in_ms(LED_ON_MS, cb_alarm, NULL, false);
+                    add_alarm_in_ms(LED_ON_MS, cb_alarm, (void*)&alarm_fired, false);
                     break;
 
                 case ST_SHOW_ON:
@@ -320,10 +316,10 @@ int main(void) {
                         player_idx    = 0;
                         pressed_color = -1;
                         state         = ST_PLAYER;
-                        timeout_id    = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, NULL, false);
+                        timeout_id    = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, (void*)&alarm_fired, false);
                     } else {
                         state = ST_SHOW_OFF;
-                        add_alarm_in_ms(LED_OFF_MS, cb_alarm, NULL, false);
+                        add_alarm_in_ms(LED_OFF_MS, cb_alarm, (void*)&alarm_fired, false);
                     }
                     break;
 
@@ -331,7 +327,7 @@ int main(void) {
                     state = ST_SHOW_ON;
                     gpio_put(led_pins[sequence[show_idx]], 1);
                     audio_play(color_to_audio[sequence[show_idx]]);  // som da cor
-                    add_alarm_in_ms(LED_ON_MS, cb_alarm, NULL, false);
+                    add_alarm_in_ms(LED_ON_MS, cb_alarm, (void*)&alarm_fired, false);
                     break;
 
                 case ST_PLAYER:
@@ -340,7 +336,7 @@ int main(void) {
                     state       = ST_ERROR;
                     blink_count = 0;
                     all_leds(true);
-                    add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, NULL, false);
+                    add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
                     break;
 
                 case ST_FEEDBACK:
@@ -352,7 +348,7 @@ int main(void) {
                         state       = ST_ERROR;
                         blink_count = 0;
                         all_leds(true);
-                        add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, NULL, false);
+                        add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
                     } else {
                         player_idx++;
                         if (player_idx >= current_level) {
@@ -362,17 +358,17 @@ int main(void) {
                                 state       = ST_WIN;
                                 blink_count = 0;
                                 all_leds(true);
-                                add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, NULL, false);
+                                add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
                             } else {
                                 /* ── Próximo nível ── */
                                 current_level++;
                                 state = ST_LEVEL_UP;
-                                add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, NULL, false);
+                                add_alarm_in_ms(LEVEL_UP_MS, cb_alarm, (void*)&alarm_fired, false);
                             }
                         } else {
                             /* ── Aguarda próxima cor ── */
                             state      = ST_PLAYER;
-                            timeout_id = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, NULL, false);
+                            timeout_id = add_alarm_in_ms(TIMEOUT_MS, cb_alarm, (void*)&alarm_fired, false);
                         }
                     }
                     break;
@@ -381,7 +377,7 @@ int main(void) {
                     all_leds(false);
                     show_idx = 0;
                     state    = ST_SHOW_PRE;
-                    add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, NULL, false);
+                    add_alarm_in_ms(PRE_SHOW_MS, cb_alarm, (void*)&alarm_fired, false);
                     break;
 
                 case ST_ERROR:
@@ -393,7 +389,7 @@ int main(void) {
                         state         = ST_WAIT_START;
                     } else {
                         all_leds(blink_count % 2 == 0);
-                        add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, NULL, false);
+                        add_alarm_in_ms(ERR_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
                     }
                     break;
 
@@ -406,7 +402,7 @@ int main(void) {
                         state         = ST_WAIT_START;
                     } else {
                         all_leds(blink_count % 2 == 0);
-                        add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, NULL, false);
+                        add_alarm_in_ms(WIN_BLINK_MS, cb_alarm, (void*)&alarm_fired, false);
                     }
                     break;
 
@@ -431,7 +427,7 @@ int main(void) {
 
                 gpio_put(led_pins[feedback_color], 1);
                 audio_play(color_to_audio[feedback_color]);  // som da cor pressionada
-                add_alarm_in_ms(FEEDBACK_MS, cb_alarm, NULL, false);
+                add_alarm_in_ms(FEEDBACK_MS, cb_alarm, (void*)&alarm_fired, false);
             }
         }
 
