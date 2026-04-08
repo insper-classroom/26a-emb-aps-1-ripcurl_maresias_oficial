@@ -198,7 +198,6 @@ static int  player_idx      = 0;
 static int  sequence[2][SEQ_LEN];
 
 static int  top5[TOP5_COUNT];
-static int  top5_new_pos = -1;
 
 static void all_leds(bool on) {
     for (int i = 0; i < 4; i++) gpio_put(led_pins[i], on);
@@ -500,7 +499,7 @@ static void setup(void) {
 }
 
 static inline void solo_game_over(int score, state_t *state_out, int *current_level_out) {
-    top5_new_pos = top5_insert(top5, score);
+    int top5_new_pos = top5_insert(top5, score);
     flash_save_top5(top5);
     lcd_show_top5(top5_new_pos);
     *current_level_out = 1;
