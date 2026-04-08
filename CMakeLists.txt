@@ -67,6 +67,7 @@ target_link_libraries(ili9341
     pico_stdlib
     hardware_gpio
     hardware_pwm
+    hardware_flash
     hardware_clocks
     pico_multicore
     hardware_spi
